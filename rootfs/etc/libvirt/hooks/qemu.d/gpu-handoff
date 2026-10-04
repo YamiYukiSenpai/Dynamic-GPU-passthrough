@@ -1,0 +1,150 @@
+#!/bin/bash
+# /etc/libvirt/hooks/qemu.d/gpu-handoff - hand the NVIDIA GPU to whichever VM has it assigned
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/var/lib/snapd/snap/bin
+VM="$1"; OP="$2"; SUB="$3"
+shopt -s nullglob
+
+GPU_BUS="0x0f"; GPU_SLOT="0x00"      # from `virsh dumpxml`
+GPU_ADDR="0000:0f:00.0"              # same card, lspci form
+LOCK="/run/gpu-4060.owner"
+STOPPED="/run/gpu-4060.stopped"      # host services/containers we stopped, restarted on release
+HOST_SERVICES=""                     # systemd units using the NVIDIA GPU, e.g. "ollama" (only stopped if running)
+HOST_CONTAINERS=""                   # docker containers using the NVIDIA GPU (only stopped if running)
+AUTO_KILL="nvidia-smi nvtop"         # GPU monitors - closed without asking
+NEVER_KILL="kwin_wayland Xwayland plasmashell plasma-login-manager systemd systemd-logind"
+PROMPT_SECS=30                       # how long the desktop prompt waits for an answer
+WAIT_SECS=10                         # grace period after SIGTERM before SIGKILL
+
+log()  { logger -t gpu-handoff "[$VM] $*"; }
+fail() { log "$*"; echo "$*" >&2; restore_host; exit 1; }
+
+restore_host() {
+    systemctl is-enabled -q nvidia-persistenced 2>/dev/null && systemctl start --no-block nvidia-persistenced
+    [[ -f $STOPPED ]] || return 0
+    local svcs ctrs
+    { read -r svcs; read -r ctrs; } < "$STOPPED"
+    rm -f "$STOPPED"
+    [[ -n $svcs ]] && systemctl start --no-block $svcs
+    [[ -n $ctrs ]] && docker start $ctrs >/dev/null 2>&1 &
+}
+
+stop_host_users() {
+    local u svcs="" ctrs=""
+    for u in $HOST_SERVICES; do systemctl is-active -q "$u" && svcs+="$u "; done
+    for u in $HOST_CONTAINERS; do
+        [[ $(docker inspect -f '{{.State.Running}}' "$u" 2>/dev/null) == true ]] && ctrs+="$u "
+    done
+    printf '%s\n%s\n' "$svcs" "$ctrs" > "$STOPPED"
+    [[ -n $svcs ]] && systemctl stop $svcs
+    [[ -n $ctrs ]] && docker stop $ctrs >/dev/null 2>&1
+    systemctl stop nvidia-persistenced 2>/dev/null
+}
+
+# PIDs with the NVIDIA GPU open: /dev/nvidia* plus the card's own /dev/dri nodes
+gpu_pids() {
+    local nodes=(/dev/nvidia*) n
+    for n in /sys/bus/pci/devices/$GPU_ADDR/drm/*; do
+        [[ -e /dev/dri/${n##*/} ]] && nodes+=("/dev/dri/${n##*/}")
+    done
+    (( ${#nodes[@]} )) && fuser "${nodes[@]}" 2>/dev/null | xargs
+}
+
+pid_names() { local l; l=$(xargs <<<"$1"); [[ -n $l ]] && ps -o comm= -p "${l// /,}" 2>/dev/null | sort -u | xargs; }
+
+# Ask the logged-in desktop user via a notification; succeeds only on "Close them"
+ask_user() {
+    local sid user="" uid ans
+    while read -r sid _; do
+        [[ $(loginctl show-session "$sid" -p Active --value) == yes ]] || continue
+        [[ $(loginctl show-session "$sid" -p Type --value) == @(wayland|x11) ]] || continue
+        user=$(loginctl show-session "$sid" -p Name --value); break
+    done < <(loginctl list-sessions --no-legend 2>/dev/null)
+    [[ -n $user ]] && command -v notify-send >/dev/null || return 1
+    uid=$(id -u "$user")
+    ans=$(timeout -k 2 "$PROMPT_SECS" runuser -u "$user" -- env \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            notify-send -a "GPU handoff" -i video-display -u critical -w \
+            -A kill="Close them" -A cancel="Cancel" \
+            "Start VM '$VM'?" "The NVIDIA GPU is in use by: $1")
+    [[ $ans == kill ]]
+}
+
+kill_and_wait() {
+    local pids=$1 left i
+    kill $pids 2>/dev/null
+    for ((i=0; i<WAIT_SECS; i++)); do
+        left=$(gpu_pids); [[ -z $left ]] && return 0
+        sleep 1
+    done
+    kill -9 $left 2>/dev/null; sleep 1
+    [[ -z $(gpu_pids) ]]
+}
+
+free_gpu() {
+    local pids p mon="" names
+    pids=$(gpu_pids); [[ -z $pids ]] && return 0
+    local critical_process=""
+    for p in $pids; do
+        [[ " $NEVER_KILL " == *" $(ps -o comm= -p "$p") "* ]] && critical_process+="$p "
+    done
+    [[ -n $critical_process ]] && fail "NVIDIA GPU held by critical components: $(pid_names "$critical_process")"
+
+    for p in $pids; do [[ " $AUTO_KILL " == *" $(ps -o comm= -p "$p") "* ]] && mon+="$p "; done
+    if [[ -n $mon ]]; then
+        log "closing GPU monitors: $(pid_names "$mon")"
+        kill_and_wait "$mon"
+        pids=$(gpu_pids); [[ -z $pids ]] && return 0
+    fi
+
+    names=$(pid_names "$pids")
+    ask_user "$names" || fail "NVIDIA GPU busy - close: $names"
+    log "closing at user's request: $names"
+    kill_and_wait "$pids" || fail "NVIDIA GPU still busy after kill: $(pid_names "$(gpu_pids)")"
+}
+
+case "$OP/$SUB" in prepare/begin|release/end) ;; *) exit 0 ;; esac
+
+# Skip VMs that don't have the NVIDIA GPU assigned
+XML=$(cat)
+COUNT=$(xmllint --xpath "count(//hostdev[@type='pci']/source/address[@bus='$GPU_BUS' and @slot='$GPU_SLOT'])" - <<<"$XML" 2>/dev/null)
+[[ "${COUNT:-0}" == 0 ]] && exit 0
+
+case "$OP/$SUB" in
+  prepare/begin)
+    [[ -f $LOCK ]] && { echo "NVIDIA GPU is already in use by VM '$(<"$LOCK")'" >&2; exit 1; }
+
+    stop_host_users
+
+    if lsmod | grep -q '^nvidia '; then
+        for i in 1 2 3; do
+            free_gpu
+            modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia 2>/dev/null && break
+            sleep 1
+        done
+        lsmod | grep -q '^nvidia ' && fail "Couldn't unload the NVIDIA driver (check: lsmod | grep nvidia)"
+    fi
+
+    echo "$VM" > "$LOCK"
+    log "NVIDIA GPU handed to VM"
+    ;;
+
+  release/end)
+    [[ -f $LOCK && "$(<"$LOCK")" == "$VM" ]] || exit 0
+    rm -f "$LOCK"
+
+    modprobe nvidia_drm
+    modprobe nvidia_uvm
+
+    # Make sure the card really went back to the nvidia driver
+    drv=$(basename "$(readlink /sys/bus/pci/devices/$GPU_ADDR/driver 2>/dev/null)" 2>/dev/null)
+    if [[ $drv != nvidia ]]; then
+        echo > /sys/bus/pci/devices/$GPU_ADDR/driver_override
+        [[ -n $drv ]] && echo "$GPU_ADDR" > /sys/bus/pci/drivers/$drv/unbind
+        echo "$GPU_ADDR" > /sys/bus/pci/drivers_probe
+    fi
+
+    restore_host
+    log "NVIDIA GPU returned to host"
+    ;;
+esac
+exit 0
