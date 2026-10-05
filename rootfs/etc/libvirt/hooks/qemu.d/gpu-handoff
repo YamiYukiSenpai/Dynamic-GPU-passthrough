@@ -6,8 +6,8 @@ shopt -s nullglob
 
 GPU_BUS="0x0f"; GPU_SLOT="0x00"      # from `virsh dumpxml`
 GPU_ADDR="0000:0f:00.0"              # same card, lspci form
-LOCK="/run/gpu-4060.owner"
-STOPPED="/run/gpu-4060.stopped"      # host services/containers we stopped, restarted on release
+LOCK="/run/gpu-secondary.owner"
+STOPPED="/run/gpu-secondary.stopped"      # host services/containers we stopped, restarted on release
 HOST_SERVICES=""                     # systemd units using the NVIDIA GPU, e.g. "ollama" (only stopped if running)
 HOST_CONTAINERS=""                   # docker containers using the NVIDIA GPU (only stopped if running)
 AUTO_KILL="nvidia-smi nvtop"         # GPU monitors - closed without asking
