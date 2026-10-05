@@ -22,7 +22,7 @@ The 3 components here do the following:
         * **WIP** Ideally, it should be asking via notification popup if I want to kill any processes that aren't in `AUTO_KILL`, but it doesn't seem to work yet (tested when I commented out the `NEVER_KILL` variable).
     * Once nothing is holding the NVIDIA GPU, it'll unload the NVIDIA modules.
     * After the VM shuts down, it reloads the driver and rebinds the card.  Ideally, it'll restart whatever it stopped, but I haven't tested that yet.
-    > [!IMPORTANT]
+    > **Important:**
     > * Add the process name of your desktop environment, or anything else you deem very important, to `NEVER_KILL`.
     > * Edit `GPU_BUS`, `GPU_SLOT` & `GPU_ADDR`.  Those values are from my own setup.
 * `/etc/xdg/plasma-workspace/env/10-no-nvidia-display.sh` searches for any non-NVIDIA GPUs. If it finds one, it'll set the [`KWIN_DRM_DEVICES`][kwin] environment variable to those GPUs.  It also sets the environment variables [`VK_DRIVER_FILES`][vk] and [`__EGL_VENDOR_LIBRARY_FILENAMES`][egl] so that desktop apps don't use the NVIDIA GPU either.
@@ -35,8 +35,7 @@ The 3 components here do the following:
 The directory structure in `rootfs/` mirrors `/`.
 1. Install `libxml2` (Arch) / `libxml2-utils` (Ubuntu), `libnotify` (Arch) / `libnotify-bin` (Ubuntu) and `psmisc` from your package manager (`apt`, `pacman`, etc.).
 2. Copy the files to the matching paths under `/`:
-    > [!WARNING]
-    > If you already have your own `nvidia.conf` in `/etc/modprobe.d`, the command below will overwrite it. Back it up first, then copy your old settings from the backup into the new file.
+    > **Warning:** If you already have your own `nvidia.conf` in `/etc/modprobe.d`, the command below will overwrite it. Back it up first, then copy your old settings from the backup into the new file.
     ```sh
     sudo cp -r rootfs/* /
     sudo chmod +x /etc/xdg/plasma-workspace/env/10-no-nvidia-display.sh
