@@ -19,6 +19,10 @@ log()  { logger -t gpu-handoff "[$VM] $*"; }
 fail() { log "$*"; echo "$*" >&2; restore_host; exit 1; }
 
 restore_host() {
+    # Also covers a start that failed halfway through unloading
+    modprobe nvidia_drm
+    modprobe nvidia_uvm
+    refresh_cdi
     systemctl is-enabled -q nvidia-persistenced 2>/dev/null && systemctl start --no-block nvidia-persistenced
     [[ -f $STOPPED ]] || return 0
     local svcs ctrs
@@ -28,30 +32,85 @@ restore_host() {
     [[ -n $ctrs ]] && docker start $ctrs >/dev/null 2>&1 &
 }
 
+# The card's /dev/dri/cardN number can change when nvidia_drm reloads, and the CDI spec
+# containers use hardcodes it - regenerate it so they can start again
+refresh_cdi() {
+    local f
+    udevadm settle
+    if systemctl cat snap.docker.nvidia-container-toolkit.service >/dev/null 2>&1; then
+        snap restart docker.nvidia-container-toolkit >/dev/null 2>&1 || log "couldn't regenerate the Docker snap's CDI spec"
+    fi
+    command -v nvidia-ctk >/dev/null || return 0
+    for f in /etc/cdi/nvidia.yaml /var/run/cdi/nvidia.yaml; do
+        [[ -f $f ]] || continue
+        nvidia-ctk cdi generate --output="$f" >/dev/null 2>&1 || log "couldn't regenerate CDI spec $f"
+    done
+}
+
+# Stop services ($1) and containers ($2), adding them to $STOPPED so restore_host restarts them
+stop_and_remember() {
+    local svcs="" ctrs=""
+    [[ -f $STOPPED ]] && { read -r svcs; read -r ctrs; } < "$STOPPED"
+    printf '%s\n%s\n' "$(xargs <<<"$svcs $1")" "$(xargs <<<"$ctrs $2")" > "$STOPPED"
+    [[ -n $1 ]] && systemctl stop $1
+    [[ -n $2 ]] && docker stop $2 >/dev/null 2>&1
+}
+
 stop_host_users() {
     local u svcs="" ctrs=""
+    rm -f "$STOPPED"
     for u in $HOST_SERVICES; do systemctl is-active -q "$u" && svcs+="$u "; done
     for u in $HOST_CONTAINERS; do
         [[ $(docker inspect -f '{{.State.Running}}' "$u" 2>/dev/null) == true ]] && ctrs+="$u "
     done
-    printf '%s\n%s\n' "$svcs" "$ctrs" > "$STOPPED"
-    [[ -n $svcs ]] && systemctl stop $svcs
-    [[ -n $ctrs ]] && docker stop $ctrs >/dev/null 2>&1
+    stop_and_remember "$svcs" "$ctrs"
     systemctl stop nvidia-persistenced 2>/dev/null
 }
 
-# PIDs with the NVIDIA GPU open: /dev/nvidia* plus the card's own /dev/dri nodes
+# PIDs with the NVIDIA GPU open: /dev/nvidia* plus the card's own /dev/dri nodes.
+# Matches /proc/*/fd link targets by path rather than inode (fuser), so processes
+# in containers - which open their own mknod'd copies of the nodes - are found too.
 gpu_pids() {
-    local nodes=(/dev/nvidia*) n
+    local match=(-lname '/dev/nvidia*') n
     for n in /sys/bus/pci/devices/$GPU_ADDR/drm/*; do
-        [[ -e /dev/dri/${n##*/} ]] && nodes+=("/dev/dri/${n##*/}")
+        match+=(-o -lname "/dev/dri/${n##*/}")
     done
-    (( ${#nodes[@]} )) && fuser "${nodes[@]}" 2>/dev/null | xargs
+    find /proc/[0-9]*/fd -mindepth 1 \( "${match[@]}" \) 2>/dev/null | cut -d/ -f3 | sort -un | xargs
 }
 
 pid_names() { local l; l=$(xargs <<<"$1"); [[ -n $l ]] && ps -o comm= -p "${l// /,}" 2>/dev/null | sort -u | xargs; }
 
-# Ask the logged-in desktop user via a notification; succeeds only on "Close them"
+# Is the process's name in the list? comm is cut to 15 chars, so compare list entries the same way
+pid_in() {
+    local comm n; comm=$(ps -o comm= -p "$1") || return 1
+    for n in $2; do [[ $comm == "${n:0:15}" ]] && return 0; done
+    return 1
+}
+
+# What a PID belongs to, from its cgroup: "container <name>", "service <unit>", or nothing
+pid_owner() {
+    local cg name; cg=$(grep -m1 '^0::' "/proc/$1/cgroup" 2>/dev/null)
+    if [[ $cg =~ (docker-|/docker/)([0-9a-f]{64}) ]]; then
+        name=$(docker inspect -f '{{.Name}}' "${BASH_REMATCH[2]}" 2>/dev/null)
+        [[ -n $name ]] && echo "container ${name#/}"
+    elif [[ $cg =~ ^0::/system\.slice/([^/]+\.service) ]]; then
+        echo "service ${BASH_REMATCH[1]}"
+    fi
+}
+
+# Unload the NVIDIA modules one by one; on failure, UNLOAD_ERR says which one and why
+unload_nvidia() {
+    local m out
+    for m in nvidia_drm nvidia_modeset nvidia_uvm nvidia; do
+        [[ -d /sys/module/$m ]] || continue          # not loaded, or already removed as a dependency
+        out=$(modprobe -r "$m" 2>&1) && continue
+        UNLOAD_ERR="$m: ${out#modprobe: FATAL: } (refcnt $(cat /sys/module/$m/refcnt 2>/dev/null))"
+        return 1
+    done
+}
+
+# Ask the logged-in desktop user via a notification; prints "kill", "cancel", or nothing (no answer).
+# Fails if there's nobody to ask.
 ask_user() {
     local sid user="" uid ans
     while read -r sid _; do
@@ -59,14 +118,16 @@ ask_user() {
         [[ $(loginctl show-session "$sid" -p Type --value) == @(wayland|x11) ]] || continue
         user=$(loginctl show-session "$sid" -p Name --value); break
     done < <(loginctl list-sessions --no-legend 2>/dev/null)
-    [[ -n $user ]] && command -v notify-send >/dev/null || return 1
+    [[ -n $user ]] || { log "no active graphical session to ask"; return 1; }
+    command -v notify-send >/dev/null || { log "notify-send not installed, can't ask"; return 1; }
     uid=$(id -u "$user")
     ans=$(timeout -k 2 "$PROMPT_SECS" runuser -u "$user" -- env \
             DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
-            notify-send -a "GPU handoff" -i video-display -u critical -w \
+            notify-send -a "GPU handoff" -i video-display -u normal -t "$((PROMPT_SECS * 1000))" -w \
             -A kill="Close them" -A cancel="Cancel" \
-            "Start VM '$VM'?" "The NVIDIA GPU is in use by: $1")
-    [[ $ans == kill ]]
+            "Start VM '$VM'?" "The NVIDIA GPU is in use by: $1" 2>&1)
+    log "asked $user, answer: ${ans:-none (status $?)}"
+    echo "$ans"
 }
 
 kill_and_wait() {
@@ -81,25 +142,45 @@ kill_and_wait() {
 }
 
 free_gpu() {
-    local pids p mon="" names
+    local pids p mon="" owner svcs="" ctrs="" procs="" what=() names
     pids=$(gpu_pids); [[ -z $pids ]] && return 0
     local critical_process=""
-    for p in $pids; do
-        [[ " $NEVER_KILL " == *" $(ps -o comm= -p "$p") "* ]] && critical_process+="$p "
-    done
+    for p in $pids; do pid_in "$p" "$NEVER_KILL" && critical_process+="$p "; done
     [[ -n $critical_process ]] && fail "NVIDIA GPU held by critical components: $(pid_names "$critical_process")"
 
-    for p in $pids; do [[ " $AUTO_KILL " == *" $(ps -o comm= -p "$p") "* ]] && mon+="$p "; done
+    for p in $pids; do pid_in "$p" "$AUTO_KILL" && mon+="$p "; done
     if [[ -n $mon ]]; then
         log "closing GPU monitors: $(pid_names "$mon")"
         kill_and_wait "$mon"
         pids=$(gpu_pids); [[ -z $pids ]] && return 0
     fi
 
-    names=$(pid_names "$pids")
-    ask_user "$names" || fail "NVIDIA GPU busy - close: $names"
-    log "closing at user's request: $names"
-    kill_and_wait "$pids" || fail "NVIDIA GPU still busy after kill: $(pid_names "$(gpu_pids)")"
+    # Containers and system services get stopped cleanly (and restarted on release), plain processes killed
+    for p in $pids; do
+        owner=$(pid_owner "$p")
+        case $owner in
+            container\ *) [[ " $ctrs " == *" ${owner#* } "* ]] || ctrs+="${owner#* } " ;;
+            service\ *)   [[ " $svcs " == *" ${owner#* } "* ]] || svcs+="${owner#* } " ;;
+            *)            procs+="$p " ;;
+        esac
+    done
+    [[ -n $procs ]] && what+=("$(pid_names "$procs")")
+    for p in $ctrs; do what+=("container $p"); done
+    for p in $svcs; do what+=("service $p"); done
+    names=$(printf '%s, ' "${what[@]}"); names=${names%, }
+
+    local ans
+    ans=$(ask_user "$names") || fail "NVIDIA GPU busy - close: $names"
+    case $ans in
+      kill)
+        log "closing at user's request: $names"
+        stop_and_remember "$svcs" "$ctrs"
+        pids=$(gpu_pids); [[ -z $pids ]] && return 0
+        kill_and_wait "$pids" || fail "NVIDIA GPU still busy after kill: $(pid_names "$(gpu_pids)")"
+        ;;
+      cancel) fail "It was decided to let the NVIDIA GPU stay on the host (in use by: $names)" ;;
+      *)      fail "No answer within ${PROMPT_SECS}s, so the NVIDIA GPU stays on the host (in use by: $names)" ;;
+    esac
 }
 
 case "$OP/$SUB" in prepare/begin|release/end) ;; *) exit 0 ;; esac
@@ -118,10 +199,10 @@ case "$OP/$SUB" in
     if lsmod | grep -q '^nvidia '; then
         for i in 1 2 3; do
             free_gpu
-            modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia 2>/dev/null && break
+            unload_nvidia && break
             sleep 1
         done
-        lsmod | grep -q '^nvidia ' && fail "Couldn't unload the NVIDIA driver (check: lsmod | grep nvidia)"
+        lsmod | grep -q '^nvidia ' && fail "Couldn't unload the NVIDIA driver - $UNLOAD_ERR"
     fi
 
     echo "$VM" > "$LOCK"
