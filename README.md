@@ -31,7 +31,15 @@ The 3 components here do the following:
     > **Important:**
     > * Add the process name of your desktop environment, or anything else you deem very important, to `NEVER_KILL`.
     > * Edit `GPU_BUS`, `GPU_SLOT` & `GPU_ADDR`.  Those values are from my own setup.
-* `/etc/xdg/plasma-workspace/env/10-no-nvidia-display.sh` searches for any non-NVIDIA GPUs. If it finds one, it'll set the [`KWIN_DRM_DEVICES`][kwin] environment variable to those GPUs.  It also sets the environment variables [`VK_DRIVER_FILES`][vk] and [`__EGL_VENDOR_LIBRARY_FILENAMES`][egl] so that desktop apps don't use the NVIDIA GPU either.
+* `/etc/xdg/plasma-workspace/env/10-no-nvidia-display.sh` searches for any non-NVIDIA GPUs. If it finds one, it'll set the [`KWIN_DRM_DEVICES`][kwin] environment variable to those GPUs.  It also sets the environment variables [`VK_DRIVER_FILES`][vk], [`__EGL_VENDOR_LIBRARY_FILENAMES`][egl] and `__GLX_VENDOR_LIBRARY_NAME` so that desktop apps don't use the NVIDIA GPU either.
+    * Zen Browser was snagging my NVIDIA GPU for video decoding because it was the first render node, so this points the VA-API/VDPAU drivers and `MOZ_DRM_DEVICE` at a non-NVIDIA GPU (it shows up as "RDD Process" in the hook's prompt).
+* `/var/lib/flatpak/overrides/global` does the same for Flatpak apps, since they can't see the host paths above. It points them at the sandbox's own Mesa files.
+* `/usr/local/bin/nvidia-run` is a way to run an app on the NVIDIA card when you want to. It only affects that launch; everything else stays on the default GPU.
+    ```sh
+    nvidia-run <command>
+    nvidia-run flatpak run <app id>
+    ```
+    CUDA apps don't need it; these variables only affect graphics and video decoding.
 
 [kwin]: https://invent.kde.org/plasma/kwin/-/wikis/Environment-Variables#kwin_drm_devices
 [vk]: https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderInterfaceArchitecture.md#active-environment-variables
@@ -41,11 +49,12 @@ The 3 components here do the following:
 The directory structure in `rootfs/` mirrors `/`.
 1. Install `libxml2` (Arch) / `libxml2-utils` (Ubuntu), and `libnotify` (Arch) / `libnotify-bin` (Ubuntu) from your package manager (`apt`, `pacman`, etc.).
 2. Copy the files to the matching paths under `/`:
-    > **Warning:** If you already have your own `nvidia.conf` in `/etc/modprobe.d`, the command below will overwrite it. Back it up first, then copy your old settings from the backup into the new file.
+    > **Warning:** If you already have your own `nvidia.conf` in `/etc/modprobe.d` or a system-wide Flatpak override in `/var/lib/flatpak/overrides/global`, the command below will overwrite it. Back it up first, then copy your old settings from the backup into the new file.
     ```sh
     sudo cp -r rootfs/* /
     sudo chmod +x /etc/xdg/plasma-workspace/env/10-no-nvidia-display.sh
     sudo chmod +x /etc/libvirt/hooks/qemu.d/gpu-handoff
+    sudo chmod +x /usr/local/bin/nvidia-run
     ```
 3. Rebuild the initramfs, then reboot:
     * Garuda Linux
@@ -64,7 +73,7 @@ The directory structure in `rootfs/` mirrors `/`.
     ```sh
     sudo systemctl restart libvirtd
     ```
-5. If you only updated the Plasma script, log out and log back in.
+5. If you only updated the Plasma script or the Flatpak override, log out and log back in.
 
 ## TODO
 * LXD/LXC support: processes in LXD containers using the NVIDIA GPU are detected, but "Close them" kills them instead of stopping the container, and the container isn't restarted afterwards.  The hook should recognize the `lxc.payload.<name>` cgroup, stop the container with `lxc stop <name>`, and run `lxc start <name>` after the VM shuts down.
