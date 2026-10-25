@@ -1,0 +1,6 @@
+[Environment]
+# Flatpak apps can't see the host paths set by 10-no-nvidia-display.sh,
+# so point them at the sandbox's Mesa files instead.
+# Run an app on NVIDIA anyway with: nvidia-run flatpak run <app id>
+VK_DRIVER_FILES=/usr/lib/x86_64-linux-gnu/GL/default/lib/vulkan/icd.d/radeon_icd.x86_64.json:/usr/lib/x86_64-linux-gnu/GL/default/lib/vulkan/icd.d/intel_icd.x86_64.json:/usr/lib/i386-linux-gnu/GL/default/lib/vulkan/icd.d/radeon_icd.i686.json:/usr/lib/i386-linux-gnu/GL/default/lib/vulkan/icd.d/intel_icd.i686.json
+__EGL_VENDOR_LIBRARY_FILENAMES=/usr/lib/x86_64-linux-gnu/GL/default/share/glvnd/egl_vendor.d/50_mesa.json
