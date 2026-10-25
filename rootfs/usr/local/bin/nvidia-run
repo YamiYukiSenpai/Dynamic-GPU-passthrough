@@ -1,0 +1,32 @@
+#!/bin/sh
+# Run a program on the NVIDIA GPU, undoing the defaults set by
+# /etc/xdg/plasma-workspace/env/10-no-nvidia-display.sh
+#   nvidia-run <command> [args...]
+#   nvidia-run flatpak run <app id> [args...]
+
+[ $# -gt 0 ] || { echo "usage: nvidia-run <command> [args...]" >&2; exit 2; }
+
+nv_render=""
+for r in /sys/class/drm/renderD*; do
+    [ "$(cat "$r/device/vendor" 2>/dev/null)" = "0x10de" ] && nv_render="/dev/dri/${r##*/}" && break
+done
+[ -n "$nv_render" ] || { echo "nvidia-run: no NVIDIA GPU on the host (is a VM using it?)" >&2; exit 1; }
+
+unset VK_DRIVER_FILES __EGL_VENDOR_LIBRARY_FILENAMES LIBVA_DRIVER_NAME VDPAU_DRIVER
+export __NV_PRIME_RENDER_OFFLOAD=1
+export __GLX_VENDOR_LIBRARY_NAME=nvidia
+export __VK_LAYER_NV_optimus=NVIDIA_only
+export MOZ_DRM_DEVICE="$nv_render"
+
+# The global Flatpak override wins over inherited env, so undo it explicitly
+if [ "$1" = flatpak ] && [ "$2" = run ]; then
+    shift 2
+    exec flatpak run \
+        --unset-env=VK_DRIVER_FILES \
+        --unset-env=__EGL_VENDOR_LIBRARY_FILENAMES \
+        --unset-env=LIBVA_DRIVER_NAME \
+        --unset-env=VDPAU_DRIVER \
+        "$@"
+fi
+
+exec "$@"
